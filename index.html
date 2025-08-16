@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Endless Runner – HTML5 (Subway-Style)</title>
+  <style>
+    :root {
+      --bg: #0f1428;
+      --fg: #eef0ff;
+    }
+    html, body {
+      height: 100%;
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, "Helvetica Neue", Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      user-select: none;
+      -webkit-user-select: none;
+      overflow: hidden;
+    }
+    #wrap {
+      display: grid;
+      place-items: center;
+      height: 100%;
+      gap: 12px;
+    }
+    canvas {
+      width:  min(100vw, 100vh * 4/3);
+      height: min(100vh, 100vw * 3/4);
+      max-width: 100%;
+      box-shadow: 0 10px 40px rgba(0,0,0,.55), 0 2px 8px rgba(0,0,0,.4);
+      border-radius: 16px;
+      background: #0f1428;
+    }
+    .hud {
+      text-align: center;
+      opacity: .9;
+      font-size: 14px;
+    }
+    .btns { display:flex; gap:8px; justify-content:center; flex-wrap:wrap; }
+    button {
+      background:#1f2547; color:#eaf0ff; border:1px solid #3a3f7a; border-radius:12px;
+      padding:10px 14px; font-weight:600; cursor:pointer; box-shadow: inset 0 -2px 0 rgba(255,255,255,.08);
+    }
+    button:active { transform: translateY(1px); }
+    .hint { opacity:.7 }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="game" width="800" height="600"></canvas>
+    <div class="hud">
+      <div class="btns">
+        <button id="playBtn" title="Space / Enter">▶ Start</button>
+        <button id="restartBtn" title="R">↻ Restart</button>
+        <button id="muteBtn">🔊 Sound Off</button>
+      </div>
+      <div class="hint">Move: A/D or ←/→ — Jump: W/↑/Space — Slide: S/↓ — Click canvas for touch controls</div>
+    </div>
+  </div>
+
+  <script>
+    // =============================
+    // CONFIG (mirrors the Pygame version)
+    // =============================
+    const WIDTH = 800, HEIGHT = 600, FPS = 60;
+    const LANES = 3;
+    const LANE_X = Array.from({length: LANES}, (_, i) => WIDTH * (i + 1) / (LANES + 1));
+    const GROUND_Y = HEIGHT - 120;
+
+    const BG_COLOR_TOP    = [15, 20, 40];
+    const BG_COLOR_BOTTOM = [30, 35, 70];
+    const TRACK_COLOR     = [45, 50, 90];
+    const LANE_LINE_COLOR = [80, 85, 140];
+    const TEXT_COLOR      = [240, 240, 255];
+    const COIN_COLOR      = [255, 215, 0];
+
+    const PLAYER_COLOR  = [120, 200, 255];
+    const PLAYER_OUTLINE= [10, 30, 60];
+
+    const OBSTACLE_COLORS = {
+      train:   [220, 80, 80],
+      barrier: [220, 180, 80],
+      low:     [120, 220, 120]
+    };
+
+    // Gameplay tuning
+    const START_SPEED = 420.0;
+    const MAX_SPEED   = 900.0;
+    const ACCEL_PER_SEC = 14.0;
+    const SPAWN_INTERVAL_BASE = 0.95;
+    const SPAWN_INTERVAL_MIN  = 0.45;
+    const COIN_SPAWN_CHANCE   = 0.55;
+
+    const JUMP_VEL  = -850.0;
+    const GRAVITY   = 2500.0;
+    const SLIDE_TIME = 0.60;     // s
+    const LANE_SWITCH_SPEED = 2000.0;  // px/sec
+
+    // =============================
+    // UTILITIES
+    // =============================
+    const rand = (a=0,b=1)=>Math.random()*(b-a)+a;
+    const clamp=(v,lo,hi)=>Math.max(lo,Math.min(hi,v));
+    const lerp=(a,b,t)=>a+(b-a)*t;
+    const rgb=(arr, a=1)=>`rgba(${arr[0]},${arr[1]},${arr[2]},${a})`;
+
+    function rectsOverlap(a,b){
+      return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+    }
+
+    // =============================
+    // AUDIO (tiny blips; optional)
+    // =============================
+    const ctxAudio = new (window.AudioContext||window.webkitAudioContext)();
+    let muted = true;
+    function beep(freq=880, dur=0.06, type='sine', gain=0.04){
+      if(muted) return;
+      const o = ctxAudio.createOscillator();
+      const g = ctxAudio.createGain();
+      o.type = type; o.frequency.value = freq;
+      g.gain.value = gain; o.connect(g); g.connect(ctxAudio.destination);
+      o.start(); o.stop(ctxAudio.currentTime + dur);
+    }
+
+    // =============================
+    // ENTITIES
+    // =============================
+    class Player {
+      constructor(){
+        this.lane = 1;
+        this.x = LANE_X[1];
+        this.y = GROUND_Y;
+        this.w = 60; this.h = 90;
+        this.vy = 0; this.onGround = true;
+        this.sliding = false; this.slideTimer = 0;
+        this.targetLane = 1;
+      }
+      getRect(){
+        const hh = this.sliding ? Math.floor(this.h*0.55) : this.h;
+        return {x:this.x - this.w/2, y:this.y - hh, w:this.w, h:hh};
+      }
+      jump(){
+        if(this.onGround && !this.sliding){ this.onGround=false; this.vy = JUMP_VEL; beep(1200, .08, 'triangle'); }
+      }
+      startSlide(){
+        if(this.onGround && !this.sliding){ this.sliding=true; this.slideTimer = SLIDE_TIME; beep(300, .06, 'sawtooth'); }
+      }
+      update(dt){
+        // smooth lane move
+        const targetX = LANE_X[this.targetLane];
+        let dx = targetX - this.x;
+        if(Math.abs(dx) > 1){
+          const step = Math.sign(dx) * Math.min(Math.abs(dx), LANE_SWITCH_SPEED*dt);
+          this.x += step;
+        } else { this.x = targetX; this.lane = this.targetLane; }
+
+        // jump/gravity
+        if(!this.onGround){
+          this.vy += GRAVITY * dt;
+          this.y += this.vy * dt;
+          if(this.y >= GROUND_Y){ this.y = GROUND_Y; this.onGround = true; this.vy = 0; }
+        }
+        // slide timer
+        if(this.sliding){ this.slideTimer -= dt; if(this.slideTimer <= 0){ this.sliding=false; } }
+      }
+    }
+
+    class Obstacle {
+      constructor(kind, lane, y, w, h){ this.kind=kind; this.lane=lane; this.y=y; this.w=w; this.h=h; }
+      getRect(){ return { x: LANE_X[this.lane]-this.w/2, y: this.y - this.h, w: this.w, h: this.h }; }
+    }
+
+    class Coin {
+      constructor(lane, y, r=14){ this.lane=lane; this.y=y; this.r=r; }
+      getRect(){ return { x: LANE_X[this.lane]-this.r, y: this.y - this.r, w: this.r*2, h: this.r*2 }; }
+    }
+
+    class Spawner {
+      constructor(){ this.timer=0; this.interval=SPAWN_INTERVAL_BASE; }
+      updateInterval(speed){
+        let t=(speed-START_SPEED)/Math.max(1,(MAX_SPEED-START_SPEED)); t=clamp(t,0,1);
+        this.interval = SPAWN_INTERVAL_BASE - (SPAWN_INTERVAL_BASE - SPAWN_INTERVAL_MIN)*t;
+      }
+      update(dt){ this.timer -= dt; if(this.timer <= 0){ this.timer += this.interval; return true; } return false; }
+    }
+
+    // =============================
+    // GAME
+    // =============================
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+
+    // HiDPI scaling
+    function fitHiDPI(){
+      const dpr = Math.max(1, Math.min(2, window.devicePixelRatio||1));
+      const cssW = canvas.clientWidth, cssH = canvas.clientHeight;
+      canvas.width = Math.round(cssW * dpr);
+      canvas.height= Math.round(cssH * dpr);
+      ctx.setTransform(canvas.width/ WIDTH, 0, 0, canvas.height/ HEIGHT, 0, 0);
+    }
+    new ResizeObserver(fitHiDPI).observe(canvas);
+    fitHiDPI();
+
+    const Keys = new Set();
+    let state = 'MENU'; // MENU, PLAYING, GAMEOVER
+    let player, obstacles, coins, speed, spawner, scrollY, score, best=0, coinsCollected, timeAlive;
+
+    function reset(){
+      state='MENU';
+      player = new Player();
+      obstacles = []; coins = [];
+      speed = START_SPEED; spawner = new Spawner();
+      scrollY=0; score=0; coinsCollected=0; timeAlive=0;
+    }
+    function startGame(){
+      state='PLAYING';
+      player = new Player(); obstacles.length=0; coins.length=0;
+      speed = START_SPEED; spawner = new Spawner();
+      scrollY=0; score=0; coinsCollected=0; timeAlive=0;
+    }
+    function endGame(){ state='GAMEOVER'; best = Math.max(best, score); }
+
+    function spawnPattern(){
+      const r = Math.random();
+      const kind = r < 0.35 ? 'train' : (r < 0.35+0.40 ? 'barrier' : 'low');
+      const lanes = [0,1,2];
+
+      if(kind==='train'){
+        const count = Math.random() < 0.7 ? 1 : 2;
+        for(let i=0;i<count;i++){
+          const idx = lanes.splice(Math.floor(Math.random()*lanes.length),1)[0];
+          obstacles.push(new Obstacle('train', idx, -20, 140, 180));
+        }
+      } else if(kind==='barrier'){
+        const lane = lanes[Math.floor(Math.random()*lanes.length)];
+        obstacles.push(new Obstacle('barrier', lane, -20, 90, 110));
+      } else { // low
+        const lane = lanes[Math.floor(Math.random()*lanes.length)];
+        obstacles.push(new Obstacle('low', lane, -10, 110, 55));
+      }
+
+      if(Math.random() < COIN_SPAWN_CHANCE){
+        let safe = [0,1,2];
+        const recent = obstacles.slice(-3);
+        if(recent.some(o=>o.kind==='train')){
+          const blocked = recent.filter(o=>o.kind==='train').map(o=>o.lane);
+          safe = safe.filter(l=>!blocked.includes(l));
+          if(safe.length===0) safe=[Math.floor(Math.random()*LANES)];
+        }
+        const lane = safe[Math.floor(Math.random()*safe.length)];
+        const baseY = -120;
+        const n = Math.floor(rand(3,7));
+        for(let i=0;i<n;i++) coins.push(new Coin(lane, baseY - i*60));
+      }
+    }
+
+    // INPUT
+    document.addEventListener('keydown', (e)=>{
+      if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' ','a','d','w','s','A','D','W','S'].includes(e.key)) e.preventDefault();
+      if(!muted) ctxAudio.resume(); // ensure audio unlocked
+      Keys.add(e.key);
+      if(state==='MENU' && (e.key===' ' || e.key==='Enter')) startGame();
+      if(state==='PLAYING'){
+        if(e.key==='ArrowUp'||e.key==='w'||e.key==='W'||e.key===' '){ player.jump(); }
+        if(e.key==='ArrowDown'||e.key==='s'||e.key==='S'){ player.startSlide(); }
+      }
+      if(state==='GAMEOVER' && (e.key===' '||e.key==='Enter')) startGame();
+      if(e.key==='r'||e.key==='R') startGame();
+    });
+    document.addEventListener('keyup', (e)=>Keys.delete(e.key));
+
+    // Simple touch controls: tap left/right thirds to switch, swipe up/down to jump/slide
+    let touchStart=null;
+    canvas.addEventListener('pointerdown', (e)=>{ canvas.setPointerCapture(e.pointerId); touchStart={x:e.clientX,y:e.clientY,t:performance.now()}; if(state!=='PLAYING') startGame(); });
+    canvas.addEventListener('pointerup', (e)=>{
+      if(!touchStart) return; const dx = e.clientX - touchStart.x; const dy = e.clientY - touchStart.y; const adx=Math.abs(dx), ady=Math.abs(dy);
+      if(Math.max(adx,ady) < 12){
+        // tap
+        const rect = canvas.getBoundingClientRect();
+        const px = (e.clientX - rect.left) / rect.width;
+        if(px < .33 && player.targetLane>0) player.targetLane -= 1; else if(px > .66 && player.targetLane<LANES-1) player.targetLane += 1; else player.jump();
+      } else {
+        if(ady > adx){ if(dy < 0) player.jump(); else player.startSlide(); }
+        else { if(dx < 0 && player.targetLane>0) player.targetLane -= 1; if(dx > 0 && player.targetLane<LANES-1) player.targetLane += 1; }
+      }
+      touchStart=null;
+    });
+
+    // Buttons
+    document.getElementById('playBtn').onclick = ()=> startGame();
+    document.getElementById('restartBtn').onclick = ()=> startGame();
+    document.getElementById('muteBtn').onclick = (e)=>{ muted=!muted; e.target.textContent = muted? '🔇 Sound On' : '🔊 Sound Off'; if(!muted) ctxAudio.resume(); };
+
+    function handleLaneKeys(){
+      if((Keys.has('ArrowLeft')||Keys.has('a')||Keys.has('A')) && player.targetLane>0) player.targetLane-=1;
+      if((Keys.has('ArrowRight')||Keys.has('d')||Keys.has('D')) && player.targetLane<LANES-1) player.targetLane+=1;
+    }
+
+    // =============================
+    // UPDATE
+    // =============================
+    let last = performance.now();
+    function update(){
+      const now = performance.now();
+      let dt = (now - last) / 1000;
+      if(dt > 0.1) dt = 0.1; // clamp
+      last = now;
+
+      if(state==='PLAYING'){
+        // difficulty scaling
+        speed = Math.min(MAX_SPEED, speed + ACCEL_PER_SEC * dt);
+        spawner.updateInterval(speed);
+
+        scrollY += speed * dt;
+        timeAlive += dt;
+        score += speed * dt * 0.05;
+
+        if(spawner.update(dt)) spawnPattern();
+        handleLaneKeys();
+        player.update(dt);
+
+        // move world
+        for(const o of obstacles) o.y += speed * dt;
+        for(const c of coins) c.y += speed * dt;
+
+        // cleanup
+        obstacles = obstacles.filter(o => o.y - o.h < HEIGHT + 40);
+        coins = coins.filter(c => c.y - c.r < HEIGHT + 40);
+
+        // collisions
+        const pr = player.getRect();
+        // coins
+        for(let i=coins.length-1;i>=0;i--){
+          if(rectsOverlap(pr, coins[i].getRect())){ coins.splice(i,1); coinsCollected++; score += 10; beep(1500,.05,'square',.05); }
+        }
+        // obstacles
+        for(const o of obstacles){
+          if(o.lane !== player.lane) continue;
+          if(rectsOverlap(pr, o.getRect())){
+            if(o.kind==='train') { endGame(); break; }
+            else if(o.kind==='barrier'){ if(player.onGround){ endGame(); break; } }
+            else if(o.kind==='low'){ if(!player.sliding){ endGame(); break; } }
+          }
+        }
+      }
+      draw();
+      requestAnimationFrame(update);
+    }
+
+    // =============================
+    // DRAW
+    // =============================
+    function drawBackground(scroll){
+      // vertical gradient
+      const grad = ctx.createLinearGradient(0,0,0,HEIGHT);
+      grad.addColorStop(0, rgb(BG_COLOR_TOP));
+      grad.addColorStop(1, rgb(BG_COLOR_BOTTOM));
+      ctx.fillStyle = grad; ctx.fillRect(0,0,WIDTH,HEIGHT);
+
+      // track
+      ctx.fillStyle = rgb(TRACK_COLOR);
+      ctx.fillRect(0, HEIGHT/3|0, WIDTH, (HEIGHT*2/3)|0);
+
+      // lane dashed lines
+      const dashH = 40, gap = 30;
+      const offset = Math.floor(scroll % (dashH + gap));
+      ctx.fillStyle = rgb(LANE_LINE_COLOR);
+      for(const x of LANE_X){
+        for(let y = (HEIGHT/3|0) - offset; y < HEIGHT; y += dashH + gap){
+          ctx.fillRect(Math.floor(x-3), y, 6, dashH);
+        }
+      }
+    }
+
+    function roundRect(x,y,w,h,r=10){
+      ctx.beginPath();
+      ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+      ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+    }
+
+    function drawPlayer(p){
+      const r = p.getRect();
+      roundRect(r.x|0, r.y|0, r.w|0, r.h|0, 10);
+      ctx.fillStyle = rgb(PLAYER_COLOR); ctx.fill();
+      ctx.lineWidth = 2; ctx.strokeStyle = rgb(PLAYER_OUTLINE); ctx.stroke();
+    }
+
+    function drawObstacle(o){
+      const r = o.getRect();
+      roundRect(r.x|0, r.y|0, r.w|0, r.h|0, 8);
+      ctx.fillStyle = rgb(OBSTACLE_COLORS[o.kind]||[200,200,200]);
+      ctx.fill();
+    }
+
+    function drawCoin(c){
+      const x = LANE_X[c.lane];
+      ctx.beginPath(); ctx.arc(x|0, c.y|0, c.r+3, 0, Math.PI*2); ctx.fillStyle = 'rgb(60,40,0)'; ctx.fill();
+      ctx.beginPath(); ctx.arc(x|0, c.y|0, c.r, 0, Math.PI*2); ctx.fillStyle = rgb(COIN_COLOR); ctx.fill();
+      ctx.beginPath(); ctx.lineWidth = 3; ctx.strokeStyle = 'rgb(255,245,130)';
+      ctx.arc(x|0, c.y|0, Math.max(2, (c.r/2)|0), 0, Math.PI*2); ctx.stroke();
+    }
+
+    function drawHUD(){
+      ctx.fillStyle = rgb(TEXT_COLOR);
+      ctx.font = '24px Arial';
+      const s = `Score: ${Math.floor(score).toLocaleString()}    Coins: ${coinsCollected}    Speed: ${Math.floor(speed)}`;
+      ctx.fillText(s, 16, 28);
+    }
+
+    function drawMenu(){
+      ctx.fillStyle = rgb(TEXT_COLOR);
+      ctx.font = '48px Arial';
+      const title='Endless Runner';
+      const w = ctx.measureText(title).width; ctx.fillText(title, WIDTH/2 - w/2, HEIGHT/2 - 120);
+      ctx.font = '24px Arial';
+      const sub='Subway-Surfers-style (pure Canvas)';
+      ctx.fillText(sub, WIDTH/2 - ctx.measureText(sub).width/2, HEIGHT/2 - 70);
+      const how='Press SPACE / ENTER to start';
+      ctx.fillText(how, WIDTH/2 - ctx.measureText(how).width/2, HEIGHT/2 - 10);
+      const controls='Move: A/D or Left/Right — Jump: W/Up/Space — Slide: S/Down';
+      ctx.fillText(controls, WIDTH/2 - ctx.measureText(controls).width/2, HEIGHT/2 + 40);
+      const tip='Jump over yellow barriers, slide under green, avoid red trains.';
+      ctx.fillText(tip, WIDTH/2 - ctx.measureText(tip).width/2, HEIGHT/2 + 80);
+    }
+
+    function drawGameOver(){
+      ctx.fillStyle = rgb(TEXT_COLOR);
+      ctx.font = '48px Arial';
+      const over='Game Over';
+      ctx.fillText(over, WIDTH/2 - ctx.measureText(over).width/2, HEIGHT/2 - 90);
+      ctx.font = '24px Arial';
+      const s1=`Score: ${Math.floor(score).toLocaleString()}    Best: ${Math.floor(best).toLocaleString()}    Coins: ${coinsCollected}`;
+      ctx.fillText(s1, WIDTH/2 - ctx.measureText(s1).width/2, HEIGHT/2 - 30);
+      const s2='Press SPACE / ENTER to play again';
+      ctx.fillText(s2, WIDTH/2 - ctx.measureText(s2).width/2, HEIGHT/2 + 20);
+    }
+
+    function draw(){
+      drawBackground(scrollY);
+      // depth: coins behind obstacles behind player (same as original order coins->obs->player)
+      for(const c of coins) drawCoin(c);
+      for(const o of obstacles) drawObstacle(o);
+      drawPlayer(player);
+      drawHUD();
+      if(state==='MENU') drawMenu();
+      else if(state==='GAMEOVER') drawGameOver();
+    }
+
+    // Boot
+    reset();
+    update();
+  </script>
+</body>
+</html>
